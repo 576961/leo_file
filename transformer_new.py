@@ -1,6 +1,7 @@
 
 import torch
 from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 from torch.utils import data
 import math
 import os
@@ -11,13 +12,11 @@ import csv
 from nltk.translate.bleu_score import corpus_bleu
 #import torch.optim as optim
 from torch.optim.lr_scheduler import _LRScheduler
+from transformers import AutoTokenizer
 
 
-with open('C:/Users/Lenovo/Desktop/deu.txt', 'r', encoding='utf-8') as f:
-    raw_text = f.read()
-print(1)
-def preprocess_nmt(text):
-    """预处理数据集"""
+def preprocess(text, out_path=None):
+    """预处理数据集，并可将结果写入文件(out_path)。"""
     def no_space(char, prev_char):
         return char in set(',.!?') and prev_char != ' '
 
@@ -27,21 +26,146 @@ def preprocess_nmt(text):
     # 在单词和标点符号之间插入空格
     out = [' ' + char if i > 0 and no_space(char, text[i - 1]) else char
            for i, char in enumerate(text)]
-    return ''.join(out)
+    processed = ''.join(out)
+    if out_path is not None:
+        # 确保以utf-8写入，避免Windows默认编码问题
+        try:
+            with open(out_path, 'w', encoding='utf-8') as fout:
+                fout.write(processed)
+        except Exception:
+            # 若路径目录不存在，尝试创建目录后重写
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with open(out_path, 'w', encoding='utf-8') as fout:
+                fout.write(processed)
+    return processed
 
-def tokenize_nmt(text, num_examples=None):
-    """词元化“英语－法语”数据数据集"""
-    source, target = [], []
+def tokenize(text, num_examples=4000000):
+    """按空格分词并统计句长（保留为回退）。"""
+    L = []
+    count1 = 0
+    count2 = 0
+    count3 = 0
     for i, line in enumerate(text.split('\n')):
-        if num_examples and i > num_examples:
+        if i > num_examples:
             break
-        parts = line.split('\t')
-        if len(parts) >= 2:
-            source.append(parts[0].split(' '))
-            target.append(parts[1].split(' '))
-    return source, target
+        l = [tok for tok in line.split(' ') if tok != '']
+        if len(l) <= 10:
+            count1 += 1
+        if len(l) <= 20:
+            count2 += 1
+        if len(l) <= 30:
+            count3 += 1
+        L.append(l)
+    print(f"句子长度统计: <=10: {count1}, <=20: {count2}, <=30: {count3}")
+    return L
 
-def pad_nmt(text, max_len):
+
+def learn_bpe_from_text(text, num_merges=2000, show_progress=True):
+    """从文本学习 BPE 合并规则，返回合并对列表（tuple pairs）。
+
+    如果 `show_progress=True`，会打印学习进度、已用时间与 ETA，方便估算总时长。
+    """
+    vocab = {}
+    for line in text.split('\n'):
+        for w in line.split():
+            if w == '':
+                continue
+            symbols = tuple(list(w) + ['</w>'])
+            vocab[symbols] = vocab.get(symbols, 0) + 1
+
+    merges = []
+    start_time = time.time()
+    report_every = max(1, num_merges // 100)  # 最多显示 ~100 次更新
+
+    for i in range(num_merges):
+        pairs = {}
+        for word, freq in vocab.items():
+            for a, b in zip(word, word[1:]):
+                pairs[(a, b)] = pairs.get((a, b), 0) + freq
+        if not pairs:
+            if show_progress:
+                print(f"BPE: no more pairs at step {i}, finished early.")
+            break
+        best = max(pairs, key=pairs.get)
+        merges.append(best)
+        # 应用合并到词表
+        new_vocab = {}
+        for word, freq in vocab.items():
+            w = list(word)
+            j = 0
+            new_word = []
+            while j < len(w):
+                if j < len(w) - 1 and (w[j], w[j + 1]) == best:
+                    new_word.append(w[j] + w[j + 1])
+                    j += 2
+                else:
+                    new_word.append(w[j])
+                    j += 1
+            new_vocab[tuple(new_word)] = new_vocab.get(tuple(new_word), 0) + freq
+        vocab = new_vocab
+
+        # 打印进度与 ETA
+        if show_progress and ((i + 1) % report_every == 0 or i == 0):
+            elapsed = time.time() - start_time
+            per_step = elapsed / (i + 1)
+            remaining_steps = max(0, num_merges - (i + 1))
+            eta = per_step * remaining_steps
+            # 格式化为人类可读
+            def _fmt(sec):
+                if sec >= 3600:
+                    return f"{sec/3600:.1f}h"
+                if sec >= 60:
+                    return f"{sec/60:.1f}m"
+                return f"{sec:.1f}s"
+
+            print(f"BPE merges: {i+1}/{num_merges} — elapsed {_fmt(elapsed)}, ETA {_fmt(eta)}")
+
+    return merges
+
+
+def apply_bpe_to_word(word, merges):
+    """对单词应用 BPE 合并规则，返回子词列表（不含</w>标记）。"""
+    token = list(word) + ['</w>']
+    for pair in merges:
+        i = 0
+        while i < len(token) - 1:
+            if (token[i], token[i + 1]) == pair:
+                token[i] = token[i] + token[i + 1]
+                token.pop(i + 1)
+                if i > 0:
+                    i -= 1
+            else:
+                i += 1
+    if token and token[-1] == '</w>':
+        token = token[:-1]
+    return token
+
+
+def tokenize_bpe(text, merges, num_examples=4000000):
+    """使用 BPE 合并规则对文本进行分词，返回嵌套 token 列表。"""
+    L = []
+    for i, line in enumerate(text.split('\n')):
+        if i > num_examples:
+            break
+        toks = []
+        for w in line.split():
+            if w == '':
+                continue
+            toks.extend(apply_bpe_to_word(w, merges))
+        L.append(toks)
+    return L
+
+def tokenize_auto(text, tokenizer, seq_len, num_examples=4000000):
+    """使用 BPE 合并规则对文本进行分词，返回嵌套 token 列表。"""
+    L = []
+    for i, line in enumerate(text.split('\n')):
+        if i >= num_examples:
+            break
+        L.append(line)
+    return tokenizer(L, padding=True, truncation=True, max_length=seq_len, return_tensors="pt")
+
+
+def pad(text, max_len):
     for i in range(len(text)):
         if len(text[i]) + 2 >= max_len:
             text[i] = ['<bos>'] + text[i][:max_len-2] + ['<eos>']
@@ -62,7 +186,7 @@ def create_vocab(text):
 
     for sen in text:
         for i in range(len(sen)):
-            if dic_count[sen[i]] < 2:
+            if dic_count[sen[i]] < 10:  # 词频小于10的单词被替换为<unk>
                 sen[i] = '<unk>'
     vocab = {}
     for sen in text:
@@ -78,19 +202,26 @@ def build(text, vocab):
             sen[i] = vocab[sen[i]]
     return text
 
-text = preprocess_nmt(raw_text)
-source, target = tokenize_nmt(text)
-source = pad_nmt(source, max_len=10)
-target = pad_nmt(target, max_len=10)
-vocab_source = create_vocab(source)
-vocab_target = create_vocab(target)
-source_num = build(source, vocab_source)
-target_num = build(target, vocab_target)
 
-print(source_num[:50])
-print(target_num[:50])
-print(len(source_num))
-print(len(target_num))
+
+'''
+# 遍历DataLoader中的批次
+for batch_idx, batch_data in enumerate(dataloader):
+    print(f"\n--- 批次 {batch_idx} ---")
+    print(len(batch_data),len(batch_data[0]),len(batch_data[0][0]))  # [batch_size, seq_len]
+    break
+
+vocab_size = len(vocab_source)
+embedding_dim = 32
+
+embedding = nn.Embedding(
+    num_embeddings=vocab_size,  # 词表大小
+    embedding_dim=embedding_dim,  # 嵌入维度
+    padding_idx=vocab_source['<pad>']   # 填充标记的索引
+)
+
+print(source[:50])
+'''
 
 
 # 掩蔽softmax
@@ -187,8 +318,8 @@ class PositionalEncoding(nn.Module):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, X):
-        m, n = X.shape[0], X.shape[1]
+    def forward(self, X):  #X: (batch_size, num_steps, embedding_dim)
+        m, n = X.shape[1], X.shape[2]
         Y = torch.sin(torch.arange(m)).reshape(m, 1)
         for i in range(1,n):
             if i%2 == 0:
@@ -196,7 +327,7 @@ class PositionalEncoding(nn.Module):
             else:
                 new_Y = torch.cos((torch.arange(m)).reshape(m,1)/pow(10000,(i+1)/n))
             Y = torch.cat([Y,new_Y],1)
-        X = X + Y
+        X = X + torch.unsqueeze(Y, dim=0).to(X.device)
         return self.dropout(X)
 
 
@@ -218,7 +349,7 @@ class encoder_block(nn.Module):
 
 
 # 编码器
-class transformer_encoder(nn.Module):
+class TransformerEncoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_blocks,
                  normalized_shape, dropout,
                  num_head, input_size, query_size, key_size, value_size,
@@ -228,6 +359,7 @@ class transformer_encoder(nn.Module):
         self.embed_size = embed_size
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.blocks = nn.Sequential()
+        self.dropout = dropout
         for i in range(self.num_blocks):
             self.blocks.add_module('i', encoder_block(normalized_shape, dropout,
                                                       num_head, input_size, query_size, key_size, value_size,
@@ -235,7 +367,8 @@ class transformer_encoder(nn.Module):
 
     def forward(self, X, enc_valid_lens):
         X = self.embedding(X) * math.sqrt(self.embed_size)  # 把每个分量的范围变成(-1,1)
-        X += PositionalEncoding(X)
+        pos_enc = PositionalEncoding(self.dropout)
+        X += pos_enc(X)
         for i, block in enumerate(self.blocks):
             X = block(X, enc_valid_lens)
 
@@ -282,7 +415,7 @@ class decoder_block(nn.Module):
 
 
 # 解码器
-class transformer_decoder(nn.Module):
+class TransformerDecoder(nn.Module):
     def __init__(self, vocab_size, embed_size, num_blocks,
                  normalized_shape, dropout,
                  num_head, input_size, query_size, key_size, value_size,
@@ -293,7 +426,8 @@ class transformer_decoder(nn.Module):
         self.final_linear = nn.Linear(output_size, vocab_size)
         self.blocks = nn.Sequential()
         self.num_blocks = num_blocks
-
+        self.dropout = dropout
+        
         for i in range(self.num_blocks):
             self.blocks.add_module('i', decoder_block(normalized_shape, dropout,
                                                       num_head, input_size, query_size, key_size, value_size,
@@ -304,7 +438,8 @@ class transformer_decoder(nn.Module):
 
     def forward(self, X, state):
         X = self.embedding(X)
-        X += PositionalEncoding(X)
+        pos_enc = PositionalEncoding(self.dropout)
+        X += pos_enc(X)
         for i, block in enumerate(self.blocks):
             X, state = block(X, state)
 
@@ -312,7 +447,7 @@ class transformer_decoder(nn.Module):
 
 
 # transformer网络
-class transformer(nn.Module):
+class Transformer(nn.Module):
     def __init__(self, encoder, decoder, **kwargs):
         super().__init__(**kwargs)
         self.encoder = encoder
@@ -323,27 +458,190 @@ class transformer(nn.Module):
         state = self.decoder.init_state(enc_outputs, enc_valid_lens)
         return self.decoder(Y, state)
 
-num_hiddens, num_layers, dropout, batch_size, num_steps = 32, 2, 0.1, 64, 10
-lr, num_epochs, device = 0.005, 200, d2l.try_gpu()
-ffn_num_input, ffn_num_hiddens, num_heads = 32, 64, 4
+
+'''
+# 超参数设置1
+seq_len, embedding_dim = 20, 32
+num_layers, dropout, batch_size = 2, 0.1, 64
+# Ensure the attention/input sizes match the embedding dimension
+ffn_num_input, ffn_num_hiddens, ffn_num_output, num_heads = 32, 64, 32, 4
 key_size, query_size, value_size = 32, 32, 32
+# LayerNorm normalized shape must match embedding dimension
 norm_shape = [32]
+'''
 
-train_iter, src_vocab, tgt_vocab = load_data(batch_size, num_steps)
+# 超参数设置2
+seq_len, embedding_dim = 30, 512
+num_layers, dropout, batch_size = 6, 0.1, 64
+# Ensure the attention/input sizes match the embedding dimension
+ffn_num_input, ffn_num_hiddens, ffn_num_output, num_heads = 512, 2048, 512, 8
+key_size, query_size, value_size = 64, 64, 64
+# LayerNorm normalized shape must match embedding dimension
+norm_shape = [512]
 
-encoder = TransformerEncoder(
-    len(src_vocab), key_size, query_size, value_size, num_hiddens,
-    norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
-    num_layers, dropout)
-decoder = TransformerDecoder(
-    len(tgt_vocab), key_size, query_size, value_size, num_hiddens,
-    norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
-    num_layers, dropout)
-net = d2l.EncoderDecoder(encoder, decoder)
+preprocessed = True
+if not preprocessed:
+    en_path = r'C:\Users\Lenovo\PycharmProjects\ProjectTransformer\train.en'
+    de_path = r'C:\Users\Lenovo\PycharmProjects\ProjectTransformer\train.de'
+    with open(en_path, 'r', encoding='utf-8') as f:
+        raw_text_1 = f.read()
+    with open(de_path, 'r', encoding='utf-8') as f:
+        raw_text_2 = f.read()
+        
+    print(1)
 
-enc = transformer_encoder()
-dec = transformer_decoder(24, 24, 24, 24, [100, 24], 24, 48, 8, 0.5, 0)
-net = transformer(enc, dec)
+    text_1 = preprocess(raw_text_1, en_path + '.preprocessed.txt')
+    print(2)
+    text_2 = preprocess(raw_text_2, de_path + '.preprocessed.txt')
+    print(2)
+else:
+    with open(r'C:\Users\Lenovo\PycharmProjects\ProjectTransformer\train.en.preprocessed.txt', 'r', encoding='utf-8') as f:
+        text_1 = f.read()
+    with open(r'C:\Users\Lenovo\PycharmProjects\ProjectTransformer\train.de.preprocessed.txt', 'r', encoding='utf-8') as f:
+        text_2 = f.read()
+
+r'''
+# 使用 BPE 分词
+num_bpe_merges = 32000
+en_bpe_path = r'C:\Users\Lenovo\PycharmProjects\ProjectTransformer\train.en.bpe'
+de_bpe_path = r'C:\Users\Lenovo\PycharmProjects\ProjectTransformer\train.de.bpe'
+en_merges = learn_bpe_from_text(text_1, num_bpe_merges)
+de_merges = learn_bpe_from_text(text_2, num_bpe_merges)
+# 保存合并表，便于复现或查看
+with open(en_bpe_path, 'w', encoding='utf-8') as f:
+    for a, b in en_merges:
+        f.write(f"{a} {b}\n")
+with open(de_bpe_path, 'w', encoding='utf-8') as f:
+    for a, b in de_merges:
+        f.write(f"{a} {b}\n")
+'''
+   
+tokenizer = AutoTokenizer.from_pretrained("./my_bert2bert_tokenizer")
+
+'''
+# Ensure the tokenizer has an unknown token to avoid WordPiece errors
+try:
+    vocab_dict = tokenizer.get_vocab()
+except Exception:
+    vocab_dict = {}
+
+if getattr(tokenizer, 'unk_token', None) is None or ('[UNK]' not in vocab_dict):
+    tokenizer.add_special_tokens({'unk_token': '[UNK]'})
+'''
+#text_1 = text_1.split('\n')[:4000000]
+#text_2 = text_2.split('\n')[:4000000]
+#print(1)
+#print(tokenizer(text_2[760292], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids'])        
+#1266800
+'''
+for i in range(1360000, 14000000):
+    #break
+    if i%100 == 0:
+        print(i)
+    tokenizer(text_1[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
+    tokenizer(text_2[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
+
+
+for i in range(1360000, 14000000):
+    #break
+    #if i%100 == 0:
+    #    print(i)
+    try:
+        tokenizer(text_1[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
+        tokenizer(text_2[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
+    except Exception as e:
+        print(i)
+'''
+
+'''
+source_tensor = tokenizer(text_1[:100], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
+target_tensor = tokenizer(text_2[:100], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
+print(source_tensor.shape, target_tensor.shape)
+
+error_list = []
+
+with open("error_list.txt", "r", encoding="utf-8") as f:
+    for line in f.readlines():
+        error_list.append(int(line.strip()))
+
+text_clc_1 = text_1[:100]
+text_clc_2 = text_2[:100]
+for i in range(10, 400000):
+    if i not in error_list:
+        text_clc_1.extend(text_1[i*10:(i+1)*10])
+        text_clc_2.extend(text_2[i*10:(i+1)*10])
+print(len(text_clc_1), len(text_clc_2))
+
+for i in range(1, 38890):
+    #break
+    if i%100 == 0:
+        print(i)
+    try:
+        source_tensor = torch.cat((source_tensor, tokenizer(text_clc_1[i*100:(i+1)*100], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']), dim=0)
+        target_tensor = torch.cat((target_tensor, tokenizer(text_clc_2[i*100:(i+1)*100], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']), dim=0)
+    except Exception as e:
+        count += 1
+        error_list.append(i)
+        print(f"error point {i}")
+
+torch.save(source_tensor, 'source_tensor.pt')
+torch.save(target_tensor, 'target_tensor.pt')
+'''
+
+#print(f"Total errors: {count}")
+source_tensor = torch.load('source_tensor.pt')
+target_tensor = torch.load('target_tensor.pt')
+print(source_tensor[0])
+print(target_tensor[0])
+print(source_tensor.shape, target_tensor.shape)
+vocab_dict = tokenizer.get_vocab()
+vocab_source = vocab_dict
+vocab_target = vocab_dict
+print(len(vocab_source), len(vocab_target))
+
+
+'''
+source = tokenizer(text_1)
+target = tokenizer(text_2)
+source = pad(source, max_len=seq_len)
+target = pad(target, max_len=seq_len)
+print(len(source), len(target))
+
+vocab_source = create_vocab(source)
+vocab_target = create_vocab(target)
+source_num = build(source, vocab_source)
+target_num = build(target, vocab_target)
+source_tensor = torch.tensor(source_num, dtype=torch.long)
+target_tensor = torch.tensor(target_num, dtype=torch.long)
+'''
+
+
+'''
+
+dataset = TensorDataset(source_tensor, target_tensor)
+dataloader = DataLoader(
+    dataset=dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    drop_last=False  # 是否丢弃最后一个不完整的批次
+)
+
+encoder = TransformerEncoder(len(vocab_source), embedding_dim, num_layers,
+                             norm_shape, dropout, num_heads,
+                             ffn_num_input, query_size, key_size, value_size,
+                             ffn_num_hiddens, ffn_num_output)
+decoder = TransformerDecoder(len(vocab_target), embedding_dim, num_layers,
+                             norm_shape, dropout, num_heads,
+                             ffn_num_input, query_size, key_size, value_size,
+                             ffn_num_hiddens, ffn_num_output)
+net = Transformer(encoder, decoder)
+
+
 net.eval()
+X = torch.ones((batch_size, seq_len), dtype=torch.long)
+valid_lens = torch.ones(batch_size, dtype=torch.long)
+Y, _ = net(X, X, valid_lens)
+print(Y.shape)
+'''
 
-X = torch.ones((2, 100, 24))
+
