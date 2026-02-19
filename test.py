@@ -188,7 +188,8 @@ def quicksort(arr):
     greater = arr[len(arr) // 2:]
     return quicksort(less) + [pivot] + quicksort(greater)
 
-s = '5'
-s = int(s)
-print(s)
+X = torch.ones((32, 10, 293), dtype=torch.float32)
+print(X.reshape(-1, 293).shape)
 
+Y = torch.ones((32, 10), dtype=torch.float32)
+print(Y.reshape(-1).shape)

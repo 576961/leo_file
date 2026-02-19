@@ -271,7 +271,7 @@ class multi_attention(nn.Module):
         self.W_O = nn.Linear(num_head * value_size, input_size, bias=False)
         self.attention = scaled_dot_product_attention()
 
-    def forward(self, queries, keys, values, valid_lens=None):
+    def forward(self, queries, keys, values, valid_lens =None):
         projected_queries, projected_keys, projected_values = self.W_Q(queries), self.W_K(keys), self.W_V(values)
         for i in range(self.num_head):
 
@@ -471,13 +471,13 @@ norm_shape = [32]
 '''
 
 # 超参数设置2
-seq_len, embedding_dim = 30, 512
-num_layers, dropout, batch_size = 6, 0.1, 64
+seq_len, embedding_dim = 30, 128
+num_layers, dropout, batch_size = 6, 0.1, 128
 # Ensure the attention/input sizes match the embedding dimension
-ffn_num_input, ffn_num_hiddens, ffn_num_output, num_heads = 512, 2048, 512, 8
-key_size, query_size, value_size = 64, 64, 64
+ffn_num_input, ffn_num_hiddens, ffn_num_output, num_heads = 128, 512, 128, 8
+key_size, query_size, value_size = 16, 16, 16
 # LayerNorm normalized shape must match embedding dimension
-norm_shape = [512]
+norm_shape = [128]
 
 preprocessed = True
 if not preprocessed:
@@ -528,36 +528,17 @@ except Exception:
 if getattr(tokenizer, 'unk_token', None) is None or ('[UNK]' not in vocab_dict):
     tokenizer.add_special_tokens({'unk_token': '[UNK]'})
 '''
-#text_1 = text_1.split('\n')[:4000000]
-#text_2 = text_2.split('\n')[:4000000]
+text_1 = text_1.split('\n')[:4000000]
+text_2 = text_2.split('\n')[:4000000]
 #print(1)
 #print(tokenizer(text_2[760292], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids'])        
-#1266800
-'''
-for i in range(1360000, 14000000):
-    #break
-    if i%100 == 0:
-        print(i)
-    tokenizer(text_1[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
-    tokenizer(text_2[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
 
-
-for i in range(1360000, 14000000):
-    #break
-    #if i%100 == 0:
-    #    print(i)
-    try:
-        tokenizer(text_1[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
-        tokenizer(text_2[i], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
-    except Exception as e:
-        print(i)
-'''
 
 '''
 source_tensor = tokenizer(text_1[:100], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
 target_tensor = tokenizer(text_2[:100], padding=True, truncation=True, max_length=seq_len, return_tensors="pt")['input_ids']
 print(source_tensor.shape, target_tensor.shape)
-
+'''
 error_list = []
 
 with open("error_list.txt", "r", encoding="utf-8") as f:
@@ -571,7 +552,8 @@ for i in range(10, 400000):
         text_clc_1.extend(text_1[i*10:(i+1)*10])
         text_clc_2.extend(text_2[i*10:(i+1)*10])
 print(len(text_clc_1), len(text_clc_2))
-
+print(text_clc_1[3000000], text_clc_2[3000000])
+'''
 for i in range(1, 38890):
     #break
     if i%100 == 0:
@@ -589,16 +571,27 @@ torch.save(target_tensor, 'target_tensor.pt')
 '''
 
 #print(f"Total errors: {count}")
-source_tensor = torch.load('source_tensor.pt')
+source_tensor = torch.load('source_tensor.pt') #(text_size, seq_len)
 target_tensor = torch.load('target_tensor.pt')
-print(source_tensor[0])
-print(target_tensor[0])
+source_tensor = source_tensor[:2048]
+target_tensor = target_tensor[:2048]
+
+vocab_dict = tokenizer.get_vocab() #{word: id}
+pad_idx = vocab_dict['[PAD]']
+print(pad_idx)
+#print(vocab_dict['[UNK]'])
+
+source_valid_lens = (source_tensor != pad_idx).sum(dim = 1)
+target_valid_lens = (target_tensor != pad_idx).sum(dim = 1)
+#print(source_tensor[0])
+#print(target_tensor[0])
+
 print(source_tensor.shape, target_tensor.shape)
-vocab_dict = tokenizer.get_vocab()
+
 vocab_source = vocab_dict
 vocab_target = vocab_dict
 print(len(vocab_source), len(vocab_target))
-
+#print(vocab_source['[PAD]'], vocab_source['[CLS]'], vocab_source['[SEP]'])
 
 '''
 source = tokenizer(text_1)
@@ -616,9 +609,7 @@ target_tensor = torch.tensor(target_num, dtype=torch.long)
 '''
 
 
-'''
-
-dataset = TensorDataset(source_tensor, target_tensor)
+dataset = TensorDataset(source_tensor, source_valid_lens, target_tensor, target_valid_lens)
 dataloader = DataLoader(
     dataset=dataset,
     batch_size=batch_size,
@@ -637,11 +628,11 @@ decoder = TransformerDecoder(len(vocab_target), embedding_dim, num_layers,
 net = Transformer(encoder, decoder)
 
 
-net.eval()
-X = torch.ones((batch_size, seq_len), dtype=torch.long)
-valid_lens = torch.ones(batch_size, dtype=torch.long)
-Y, _ = net(X, X, valid_lens)
-print(Y.shape)
-'''
+#net.eval()
+#X = torch.ones((batch_size, seq_len), dtype=torch.long)
+#valid_lens = torch.ones(batch_size, dtype=torch.long)
+#Y, _ = net(X, X, valid_lens)
+#print(Y.shape)
+
 
 
